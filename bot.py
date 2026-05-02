@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import platform
@@ -10,6 +11,7 @@ import time
 from typing import Dict, Optional
 
 import aiohttp
+import aiohttp.web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -198,12 +200,12 @@ async def cb_menu(cq: CallbackQuery, bot: Bot):
 
 
 async def show_countries(source: Message | CallbackQuery, bot: Bot, page: int = 0):
-    oid      = owner_of(bot)
-    res      = await api("countries", {"owner_id": oid})
+    oid       = owner_of(bot)
+    res       = await api("countries", {"owner_id": oid})
     countries = (res or {}).get("data") or []
-    per      = 8
-    chunk    = countries[page * per:(page + 1) * per]
-    rows     = [
+    per       = 8
+    chunk     = countries[page * per:(page + 1) * per]
+    rows      = [
         [InlineKeyboardButton(text=c.get("name", "?"), callback_data=f"c:{c.get('id')}")]
         for c in chunk
     ]
@@ -497,9 +499,9 @@ async def poll_otps_for(owner_id: str, bot: Bot):
 
 def _gather_metrics() -> dict:
     m: dict = {
-        "uptime_s":      int(time.time() - START_TS),
-        "hostname":      socket.gethostname()[:80],
-        "platform":      f"{platform.system()} {platform.release()}"[:80],
+        "uptime_s":       int(time.time() - START_TS),
+        "hostname":       socket.gethostname()[:80],
+        "platform":       f"{platform.system()} {platform.release()}"[:80],
         "python_version": sys.version.split()[0],
     }
     if psutil:
@@ -546,12 +548,13 @@ async def otp_loop():
 
 
 async def health_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
-    return aiohttp.web.json_response({
-        "status": "ok",
-        "bots": len(bots),
-        "uptime_s": int(time.time() - START_TS),
+    body = json.dumps({
+        "status":    "ok",
+        "bots":      len(bots),
+        "uptime_s":  int(time.time() - START_TS),
         "server_id": SERVER_ID,
     })
+    return aiohttp.web.Response(text=body, content_type="application/json")
 
 
 async def run_health_server():
@@ -562,7 +565,9 @@ async def run_health_server():
     await runner.setup()
     site = aiohttp.web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("health server listening on port %d", PORT)
+    log.info("health server on port %d", PORT)
+    while True:
+        await asyncio.sleep(3600)
 
 
 async def main():
