@@ -1,0 +1,20 @@
+services:
+  - type: worker
+    name: sage-otp-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free
+    envVars:
+      - key: SERVER_ID
+        sync: false
+      - key: SERVER_SECRET
+        sync: false
+      - key: BOT_NAME
+        value: SAGE OTP
+      - key: POLL_BOTS_EVERY
+        value: "10"
+      - key: HEARTBEAT_EVERY
+        value: "1"
+      - key: OTP_POLL_EVERY
+        value: "1"
