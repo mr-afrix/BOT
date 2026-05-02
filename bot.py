@@ -34,6 +34,7 @@ BOT_NAME        = os.environ.get("BOT_NAME", "SAGE OTP")
 POLL_BOTS_EVERY = int(os.environ.get("POLL_BOTS_EVERY", "10"))
 HEARTBEAT_EVERY = int(os.environ.get("HEARTBEAT_EVERY", "1"))
 OTP_POLL_EVERY  = int(os.environ.get("OTP_POLL_EVERY", "1"))
+PORT            = int(os.environ.get("PORT", "8000"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("sage")
@@ -544,6 +545,26 @@ async def otp_loop():
         await asyncio.sleep(OTP_POLL_EVERY)
 
 
+async def health_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    return aiohttp.web.json_response({
+        "status": "ok",
+        "bots": len(bots),
+        "uptime_s": int(time.time() - START_TS),
+        "server_id": SERVER_ID,
+    })
+
+
+async def run_health_server():
+    app = aiohttp.web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("health server listening on port %d", PORT)
+
+
 async def main():
     global session
     session = aiohttp.ClientSession()
@@ -552,6 +573,7 @@ async def main():
     await reload_bots()
     log.info("▶ %s loaded %d user bots on server %s", BOT_NAME, len(bots), SERVER_ID)
     await asyncio.gather(
+        run_health_server(),
         heartbeat_loop(),
         reload_loop(),
         otp_loop(),
