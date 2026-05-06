@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import platform
+import signal
 import socket
 import sys
 import time
 from typing import Dict, Optional
 
 import aiohttp
-import aiohttp.web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -29,16 +28,19 @@ except Exception:
 
 load_dotenv()
 
-SITE_API        = "https://kwjmvkqdxqqkrcahubdf.supabase.co/functions/v1/bot-api"
-SERVER_ID       = os.environ.get("SERVER_ID", "")
-SERVER_SEC      = os.environ.get("SERVER_SECRET", "")
+SITE_API        = os.environ["SITE_API"].rstrip("/")
+SERVER_ID       = os.environ["SERVER_ID"]
+SERVER_SEC      = os.environ["SERVER_SECRET"]
 BOT_NAME        = os.environ.get("BOT_NAME", "SAGE OTP")
 POLL_BOTS_EVERY = int(os.environ.get("POLL_BOTS_EVERY", "10"))
 HEARTBEAT_EVERY = int(os.environ.get("HEARTBEAT_EVERY", "1"))
 OTP_POLL_EVERY  = int(os.environ.get("OTP_POLL_EVERY", "1"))
-PORT            = int(os.environ.get("PORT", "8000"))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
 log = logging.getLogger("sage")
 
 bots:           Dict[str, Bot]  = {}
@@ -47,16 +49,17 @@ token_to_owner: Dict[str, str]  = {}
 last_otp_seen:  Dict[str, str]  = {}
 
 session: Optional[aiohttp.ClientSession] = None
-dp      = Dispatcher()
-router  = Router()
+dp     = Dispatcher()
+router = Router()
 dp.include_router(router)
 
 _polling_task: Optional[asyncio.Task] = None
 _polling_lock = asyncio.Lock()
 START_TS = time.time()
+_shutdown_event = asyncio.Event()
 
 
-async def api(action: str, body: dict | None = None) -> dict:
+async def api(action: str, body: dict | None = None, *, retries: int = 3) -> dict:
     assert session
     payload = {"server_id": SERVER_ID, "server_secret": SERVER_SEC, **(body or {})}
     headers = {
@@ -64,18 +67,25 @@ async def api(action: str, body: dict | None = None) -> dict:
         "x-server-secret": SERVER_SEC,
         "Content-Type": "application/json",
     }
-    try:
-        async with session.post(
-            f"{SITE_API}?action={action}", json=payload, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            data = await r.json(content_type=None)
-            if r.status >= 400:
-                log.warning("api %s -> %s %s", action, r.status, data)
-            return data
-    except Exception as e:
-        log.error("api %s failed: %s", action, e)
-        return {"error": str(e)}
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            async with session.post(
+                f"{SITE_API}?action={action}", json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                data = await r.json(content_type=None)
+                if r.status >= 400:
+                    log.warning("api %s -> %s %s", action, r.status, data)
+                return data
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)
+    log.error("api %s failed after %d attempts: %s", action, retries, last_err)
+    return {"error": str(last_err)}
 
 
 def owner_of(bot: Bot) -> Optional[str]:
@@ -86,16 +96,13 @@ def is_bot_owner(bot: Bot, tg_user_id: int) -> bool:
     oid = owner_of(bot)
     if not oid:
         return False
-    meta   = owner_meta.get(oid, {})
+    meta = owner_meta.get(oid, {})
     stored = meta.get("owner_telegram_id")
     return bool(stored) and str(stored) == str(tg_user_id)
 
 
-async def passes_force_join(tg_user_id: int) -> tuple[bool, list[dict]]:
-    res = await api("verify_main", {
-        "owner_id":   next(iter(owner_meta), "00000000-0000-0000-0000-000000000000"),
-        "tg_user_id": str(tg_user_id),
-    })
+async def passes_force_join(tg_user_id: int, owner_id: str) -> tuple[bool, list[dict]]:
+    res = await api("verify_main", {"owner_id": owner_id, "tg_user_id": str(tg_user_id)})
     if res.get("error"):
         return True, []
     return bool(res.get("ok")), list(res.get("missing") or [])
@@ -103,15 +110,18 @@ async def passes_force_join(tg_user_id: int) -> tuple[bool, list[dict]]:
 
 def force_join_kb(channels: list[dict]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=f"Join {c.get('label','channel')}", url=c["url"])]
+        [InlineKeyboardButton(text=f"Join {c.get('label', 'channel')}", url=c["url"])]
         for c in channels if c.get("url")
     ]
     rows.append([InlineKeyboardButton(text="Verify Membership", callback_data="fj_check")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def gate(msg: Message) -> bool:
-    ok, missing = await passes_force_join(msg.from_user.id)
+async def gate(msg: Message, bot: Bot) -> bool:
+    oid = owner_of(bot)
+    if not oid:
+        return True
+    ok, missing = await passes_force_join(msg.from_user.id, oid)
     if not ok:
         await msg.answer(
             "<b>Join the channels below to use this bot.</b>\nThen tap <i>Verify Membership</i>.",
@@ -130,27 +140,51 @@ def main_menu_kb(is_owner: bool) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-def number_kb(phone: str, meta: dict) -> InlineKeyboardMarkup:
+def number_kb(phone: str, meta: dict, country_id=None, operator_id=None) -> InlineKeyboardMarkup:
+    change_data = f"chg:{phone}:{country_id}:{operator_id}" if country_id and operator_id else f"chg:{phone}"
     rows = [
         [InlineKeyboardButton(text="Copy Number", copy_text={"text": phone})],
-        [InlineKeyboardButton(text="Change Number", callback_data=f"chg:{phone}"),
+        [InlineKeyboardButton(text="Change Number", callback_data=change_data),
          InlineKeyboardButton(text="Release",       callback_data=f"rel:{phone}")],
-        [InlineKeyboardButton(text="Get Another",   callback_data="get_another"),
-         InlineKeyboardButton(text="Back to Menu",  callback_data="menu")],
+        [InlineKeyboardButton(text="Get Another", callback_data="get_another"),
+         InlineKeyboardButton(text="Back to Menu", callback_data="menu")],
     ]
-    extras = []
     if meta.get("channel_link"):
-        extras.append(InlineKeyboardButton(text="Join Channel", url=meta["channel_link"]))
-    if extras:
-        rows.append(extras)
+        rows.append([InlineKeyboardButton(text="Join Channel", url=meta["channel_link"])])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def otp_kb(phone: str, otp: str, meta: dict) -> InlineKeyboardMarkup:
+def with_banner_preview(text: str, meta: dict) -> str:
+    banner = str(meta.get("bot_banner_url") or "").strip()
+    if not banner.startswith(("http://", "https://")):
+        return text
+    return f'<a href="{banner}">&#8205;</a>{text}'
+
+
+async def render_number_message(
+    target: Message, phone: str, country: str, operator: str, meta: dict,
+    *, changed: bool = False, country_id=None, operator_id=None
+):
+    text = with_banner_preview((
+        f"<b>{'Number changed' if changed else 'Your number is ready'}</b>\n\n"
+        f"Country: {country or '?'}\n"
+        f"Operator: {operator or '?'}\n"
+        f"Number: <code>{phone}</code>\n\n"
+        f"OTPs will arrive here automatically."
+    ), meta)
+    kb = number_kb(phone, meta, country_id, operator_id)
+    try:
+        return await target.edit_text(text, reply_markup=kb, disable_web_page_preview=False)
+    except Exception:
+        return await target.edit_caption(caption=text, reply_markup=kb)
+
+
+def otp_kb(phone: str, otp: str, meta: dict, country_id=None, operator_id=None) -> InlineKeyboardMarkup:
+    change_data = f"chg:{phone}:{country_id}:{operator_id}" if country_id and operator_id else f"chg:{phone}"
     rows = [
         [InlineKeyboardButton(text="Copy Number", copy_text={"text": phone}),
          InlineKeyboardButton(text="Copy Code",   copy_text={"text": otp})],
-        [InlineKeyboardButton(text="Change Number", callback_data=f"chg:{phone}"),
+        [InlineKeyboardButton(text="Change Number", callback_data=change_data),
          InlineKeyboardButton(text="Release",       callback_data=f"rel:{phone}")],
         [InlineKeyboardButton(text="Get Another", callback_data="get_another")],
     ]
@@ -175,7 +209,7 @@ async def cmd_start(msg: Message, bot: Bot):
         "tg_user_id":  str(msg.from_user.id),
         "tg_username": msg.from_user.username,
     })
-    if not await gate(msg):
+    if not await gate(msg, bot):
         return
     await msg.answer(
         f"<b>Welcome to {BOT_NAME}</b>\n\n"
@@ -186,7 +220,10 @@ async def cmd_start(msg: Message, bot: Bot):
 
 @router.callback_query(F.data == "fj_check")
 async def cb_fj(cq: CallbackQuery, bot: Bot):
-    ok, _ = await passes_force_join(cq.from_user.id)
+    oid = owner_of(bot)
+    if not oid:
+        return await cq.answer("Bot not linked.", show_alert=True)
+    ok, _ = await passes_force_join(cq.from_user.id, oid)
     if ok:
         await cq.message.edit_text("Verified. You can use the bot now.")
         await cq.message.answer("Choose an action:", reply_markup=main_menu_kb(is_bot_owner(bot, cq.from_user.id)))
@@ -200,12 +237,12 @@ async def cb_menu(cq: CallbackQuery, bot: Bot):
 
 
 async def show_countries(source: Message | CallbackQuery, bot: Bot, page: int = 0):
-    oid       = owner_of(bot)
-    res       = await api("countries", {"owner_id": oid})
+    oid = owner_of(bot)
+    res = await api("countries", {"owner_id": oid})
     countries = (res or {}).get("data") or []
-    per       = 8
-    chunk     = countries[page * per:(page + 1) * per]
-    rows      = [
+    per   = 8
+    chunk = countries[page * per:(page + 1) * per]
+    rows  = [
         [InlineKeyboardButton(text=c.get("name", "?"), callback_data=f"c:{c.get('id')}")]
         for c in chunk
     ]
@@ -230,7 +267,7 @@ async def show_countries(source: Message | CallbackQuery, bot: Bot, page: int = 
 
 @router.message(F.text.in_({"Get Number", "/get"}))
 async def m_get(msg: Message, bot: Bot):
-    if not await gate(msg):
+    if not await gate(msg, bot):
         return
     await show_countries(msg, bot, 0)
 
@@ -242,7 +279,7 @@ async def cb_cpage(cq: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == "get_another")
 async def cb_again(cq: CallbackQuery, bot: Bot):
-    if not await gate(cq.message):
+    if not await gate(cq.message, bot):
         return
     await show_countries(cq, bot, 0)
 
@@ -278,36 +315,36 @@ async def cb_operator(cq: CallbackQuery, bot: Bot):
     if res.get("error"):
         return await cq.message.edit_text(f"Could not get a number: <code>{res['error']}</code>")
     phone = res["phone"]
-    await cq.message.edit_text(
-        f"<b>Your number is ready</b>\n\n"
-        f"Country: {res.get('country', '?')}\n"
-        f"Operator: {res.get('operator', '?')}\n"
-        f"Number: <code>{phone}</code>\n\n"
-        f"OTPs will arrive here automatically.",
-        reply_markup=number_kb(phone, meta),
+    await render_number_message(
+        cq.message, phone, res.get("country", "?"), res.get("operator", "?"), meta,
+        country_id=res.get("country_id") or country_id,
+        operator_id=res.get("operator_id") or operator_id,
     )
 
 
 @router.callback_query(F.data.startswith("chg:"))
 async def cb_change(cq: CallbackQuery, bot: Bot):
-    phone = cq.data.split(":", 1)[1]
-    oid   = owner_of(bot)
-    meta  = owner_meta.get(oid, {})
+    parts = cq.data.split(":")
+    phone = parts[1]
+    country_id  = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+    operator_id = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else None
+    oid  = owner_of(bot)
+    meta = owner_meta.get(oid, {})
     await cq.answer("Changing number…")
     res = await api("change_number", {
-        "owner_id":   oid,
-        "tg_user_id": str(cq.from_user.id),
-        "phone":      phone,
+        "owner_id":    oid,
+        "tg_user_id":  str(cq.from_user.id),
+        "phone":       phone,
+        "country_id":  country_id,
+        "operator_id": operator_id,
     })
     if res.get("error"):
-        return await cq.message.answer(f"Could not change: <code>{res['error']}</code>")
+        return await cq.message.edit_text(f"Could not change: <code>{res['error']}</code>")
     new = res["phone"]
-    await cq.message.answer(
-        f"<b>New number assigned</b>\n\n"
-        f"Country: {res.get('country', '?')}\n"
-        f"Operator: {res.get('operator', '?')}\n"
-        f"Number: <code>{new}</code>",
-        reply_markup=number_kb(new, meta),
+    await render_number_message(
+        cq.message, new, res.get("country", "?"), res.get("operator", "?"), meta, changed=True,
+        country_id=res.get("country_id") or country_id,
+        operator_id=res.get("operator_id") or operator_id,
     )
 
 
@@ -328,7 +365,7 @@ async def cb_release(cq: CallbackQuery, bot: Bot):
 
 @router.message(F.text.in_({"My Numbers", "/numbers"}))
 async def m_nums(msg: Message, bot: Bot):
-    if not await gate(msg):
+    if not await gate(msg, bot):
         return
     res  = await api("my_numbers", {"owner_id": owner_of(bot), "tg_user_id": str(msg.from_user.id)})
     rows = (res or {}).get("data") or []
@@ -343,7 +380,7 @@ async def m_nums(msg: Message, bot: Bot):
 
 @router.message(F.text.in_({"Balance", "/balance"}))
 async def m_bal(msg: Message, bot: Bot):
-    if not await gate(msg):
+    if not await gate(msg, bot):
         return
     res = await api("balance", {"owner_id": owner_of(bot), "tg_user_id": str(msg.from_user.id)})
     if res.get("error"):
@@ -384,6 +421,13 @@ async def m_ownstats(msg: Message, bot: Bot):
     )
 
 
+async def _close_bot(b: Bot) -> None:
+    try:
+        await b.session.close()
+    except Exception:
+        pass
+
+
 async def _init_bot(row: dict) -> Bot | None:
     token = row.get("telegram_bot_token")
     if not token:
@@ -404,7 +448,18 @@ async def _init_bot(row: dict) -> Bot | None:
         return None
 
 
-async def reload_bots():
+async def _stop_polling() -> None:
+    global _polling_task
+    if _polling_task and not _polling_task.done():
+        _polling_task.cancel()
+        try:
+            await _polling_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    _polling_task = None
+
+
+async def reload_bots() -> None:
     global _polling_task
     res  = await api("active_bots", {})
     rows = res.get("data") or []
@@ -429,25 +484,23 @@ async def reload_bots():
     for oid in dropped:
         b = bots.pop(oid, None)
         owner_meta.pop(oid, None)
-        token_to_owner.pop(b.token if b else "", None)
         if b:
-            await b.session.close()
+            token_to_owner.pop(b.token, None)
+            await _close_bot(b)
         log.info("removed bot for owner %s", oid)
         pool_changed = True
 
-    if pool_changed and bots:
-        async with _polling_lock:
-            if _polling_task and not _polling_task.done():
-                _polling_task.cancel()
-                try:
-                    await _polling_task
-                except asyncio.CancelledError:
-                    pass
+    if not pool_changed:
+        return
+
+    async with _polling_lock:
+        await _stop_polling()
+        if bots:
             _polling_task = asyncio.create_task(_run_polling())
             log.info("polling restarted with %d bots", len(bots))
 
 
-async def _run_polling():
+async def _run_polling() -> None:
     if not bots:
         return
     try:
@@ -458,7 +511,7 @@ async def _run_polling():
         log.error("polling crashed: %s", e)
 
 
-async def poll_otps_for(owner_id: str, bot: Bot):
+async def poll_otps_for(owner_id: str, bot: Bot) -> None:
     res  = await api("recent_otps", {"owner_id": owner_id})
     rows = res.get("data") or []
     if not rows:
@@ -480,18 +533,18 @@ async def poll_otps_for(owner_id: str, bot: Bot):
     for r in new:
         phone = r["phone_number"] if r["phone_number"].startswith("+") else f"+{r['phone_number']}"
         otp   = r["otp_code"]
-        text  = (
+        text  = with_banner_preview((
             f"<b>New OTP</b>\n\n"
             f"Number:  <code>{phone}</code>\n"
             f"Code:    <code>{otp}</code>\n"
             f"Service: {r.get('service', '?')}\n"
             f"Country: {r.get('country_name') or r.get('country_code') or '?'}\n\n"
             f"<i>{(r.get('full_message') or '')[:300]}</i>"
-        )
-        kb = otp_kb(phone, otp, meta)
+        ), meta)
+        kb = otp_kb(phone, otp, meta, r.get("country_id"), r.get("operator_id"))
         for t in targets:
             try:
-                await bot.send_message(t, text, reply_markup=kb, disable_web_page_preview=True)
+                await bot.send_message(t, text, reply_markup=kb, disable_web_page_preview=False)
             except Exception as e:
                 log.warning("send to %s failed: %s", t, e)
     last_otp_seen[owner_id] = rows[-1]["received_at"]
@@ -516,73 +569,90 @@ def _gather_metrics() -> dict:
     return m
 
 
-async def heartbeat_loop():
-    while True:
+async def heartbeat_loop() -> None:
+    while not _shutdown_event.is_set():
         try:
             await api("heartbeat", {
                 "bots_loaded": len(bots),
-                "metrics":     _gather_metrics(),
+                "metrics": _gather_metrics(),
             })
         except Exception as e:
             log.warning("heartbeat: %s", e)
-        await asyncio.sleep(HEARTBEAT_EVERY)
+        try:
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=HEARTBEAT_EVERY)
+        except asyncio.TimeoutError:
+            pass
 
 
-async def reload_loop():
-    while True:
+async def reload_loop() -> None:
+    while not _shutdown_event.is_set():
         try:
             await reload_bots()
         except Exception as e:
             log.error("reload: %s", e)
-        await asyncio.sleep(POLL_BOTS_EVERY)
+        try:
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=POLL_BOTS_EVERY)
+        except asyncio.TimeoutError:
+            pass
 
 
-async def otp_loop():
-    while True:
+async def otp_loop() -> None:
+    while not _shutdown_event.is_set():
         try:
             for oid, b in list(bots.items()):
                 await poll_otps_for(oid, b)
         except Exception as e:
             log.error("otp loop: %s", e)
-        await asyncio.sleep(OTP_POLL_EVERY)
+        try:
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=OTP_POLL_EVERY)
+        except asyncio.TimeoutError:
+            pass
 
 
-async def health_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
-    body = json.dumps({
-        "status":    "ok",
-        "bots":      len(bots),
-        "uptime_s":  int(time.time() - START_TS),
-        "server_id": SERVER_ID,
-    })
-    return aiohttp.web.Response(text=body, content_type="application/json")
+async def shutdown() -> None:
+    if _shutdown_event.is_set():
+        return
+    log.info("shutting down…")
+    _shutdown_event.set()
+    async with _polling_lock:
+        await _stop_polling()
+    for b in list(bots.values()):
+        await _close_bot(b)
+    bots.clear()
+    if session and not session.closed:
+        await session.close()
+    log.info("shutdown complete")
 
 
-async def run_health_server():
-    app = aiohttp.web.Application()
-    app.router.add_get("/", health_handler)
-    app.router.add_get("/health", health_handler)
-    runner = aiohttp.web.AppRunner(app)
-    await runner.setup()
-    site = aiohttp.web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info("health server on port %d", PORT)
-    while True:
-        await asyncio.sleep(3600)
-
-
-async def main():
+async def main() -> None:
     global session
-    session = aiohttp.ClientSession()
+
+    connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+    session = aiohttp.ClientSession(connector=connector)
+
     if psutil:
         psutil.cpu_percent(interval=None)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
+        except NotImplementedError:
+            pass
+
     await reload_bots()
     log.info("▶ %s loaded %d user bots on server %s", BOT_NAME, len(bots), SERVER_ID)
-    await asyncio.gather(
-        run_health_server(),
-        heartbeat_loop(),
-        reload_loop(),
-        otp_loop(),
-    )
+
+    try:
+        await asyncio.gather(
+            heartbeat_loop(),
+            reload_loop(),
+            otp_loop(),
+        )
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await shutdown()
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@ services:
     startCommand: python bot.py
     plan: free
     envVars:
+      - key: SITE_API
+        sync: false
       - key: SERVER_ID
         sync: false
       - key: SERVER_SECRET
