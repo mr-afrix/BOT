@@ -434,6 +434,7 @@ async def _init_bot(row: dict) -> Bot | None:
         return None
     try:
         b = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        await b.delete_webhook(drop_pending_updates=True)
         await b.set_my_commands([
             BotCommand(command="start",   description="Start"),
             BotCommand(command="get",     description="Get a free number"),
